@@ -162,92 +162,115 @@ export async function handleWebhook(
     );
   }
 
-  switch (event.type) {
-    case "checkout.session.completed": {
-      const session = event.data.object as Stripe.Checkout.Session;
-      if (session.mode === "subscription" && session.subscription) {
-        // Activate company subscription
-        const subId =
-          typeof session.subscription === "string"
-            ? session.subscription
-            : session.subscription.id;
+  // Stripe delivers webhooks at least once and retries any delivery that does
+  // not receive a 2xx response. Claim the event id before processing so a
+  // redelivery of the same event is not applied a second time.
+  const claim = await env.DB.prepare(
+    `INSERT INTO stripe_events (event_id, type) VALUES (?, ?)
+     ON CONFLICT(event_id) DO NOTHING`
+  )
+    .bind(event.id, event.type)
+    .run();
 
-        // Find user by customer ID
-        const customerId =
-          typeof session.customer === "string"
-            ? session.customer
-            : session.customer?.id;
+  if (!claim.meta.changes) {
+    // This event was already processed; acknowledge without applying it again.
+    return Response.json({ received: true, duplicate: true });
+  }
 
-        if (customerId) {
-          const billing = await env.DB.prepare(
-            `SELECT user_id FROM user_billing WHERE stripe_customer_id = ?`
-          )
-            .bind(customerId)
-            .first<{ user_id: string }>();
+  try {
+    switch (event.type) {
+      case "checkout.session.completed": {
+        const session = event.data.object as Stripe.Checkout.Session;
+        if (session.mode === "subscription" && session.subscription) {
+          // Activate company subscription
+          const subId =
+            typeof session.subscription === "string"
+              ? session.subscription
+              : session.subscription.id;
 
-          if (billing) {
-            // Fetch subscription to get quantity (number of companies)
-            const subscription = await stripe.subscriptions.retrieve(subId);
-            const quantity = subscription.items.data[0]?.quantity ?? 1;
+          // Find user by customer ID
+          const customerId =
+            typeof session.customer === "string"
+              ? session.customer
+              : session.customer?.id;
 
-            await env.DB.prepare(
-              `UPDATE user_billing SET stripe_subscription_id = ?, subscription_status = 'active', subscribed_company_count = ?
+          if (customerId) {
+            const billing = await env.DB.prepare(
+              `SELECT user_id FROM user_billing WHERE stripe_customer_id = ?`
+            )
+              .bind(customerId)
+              .first<{ user_id: string }>();
+
+            if (billing) {
+              // Fetch subscription to get quantity (number of companies)
+              const subscription = await stripe.subscriptions.retrieve(subId);
+              const quantity = subscription.items.data[0]?.quantity ?? 1;
+
+              await env.DB.prepare(
+                `UPDATE user_billing SET stripe_subscription_id = ?, subscription_status = 'active', subscribed_company_count = ?
                WHERE user_id = ?`
+              )
+                .bind(subId, quantity, billing.user_id)
+                .run();
+            }
+          }
+        } else if (session.mode === "payment") {
+          // Task credit purchase
+          const quantity = parseInt(session.metadata?.quantity || "0", 10);
+          const customerId =
+            typeof session.customer === "string"
+              ? session.customer
+              : session.customer?.id;
+
+          if (customerId && quantity > 0) {
+            const billing = await env.DB.prepare(
+              `SELECT user_id FROM user_billing WHERE stripe_customer_id = ?`
             )
-              .bind(subId, quantity, billing.user_id)
-              .run();
+              .bind(customerId)
+              .first<{ user_id: string }>();
+
+            if (billing) {
+              await env.DB.prepare(
+                `UPDATE user_billing SET task_credits = task_credits + ? WHERE user_id = ?`
+              )
+                .bind(quantity, billing.user_id)
+                .run();
+            }
           }
         }
-      } else if (session.mode === "payment") {
-        // Task credit purchase
-        const quantity = parseInt(session.metadata?.quantity || "0", 10);
-        const customerId =
-          typeof session.customer === "string"
-            ? session.customer
-            : session.customer?.id;
-
-        if (customerId && quantity > 0) {
-          const billing = await env.DB.prepare(
-            `SELECT user_id FROM user_billing WHERE stripe_customer_id = ?`
-          )
-            .bind(customerId)
-            .first<{ user_id: string }>();
-
-          if (billing) {
-            await env.DB.prepare(
-              `UPDATE user_billing SET task_credits = task_credits + ? WHERE user_id = ?`
-            )
-              .bind(quantity, billing.user_id)
-              .run();
-          }
-        }
+        break;
       }
-      break;
-    }
 
-    case "customer.subscription.updated": {
-      const sub = event.data.object as Stripe.Subscription;
-      const status = sub.status === "active" || sub.status === "trialing"
-        ? "active"
-        : sub.status;
-      const quantity = sub.items.data[0]?.quantity ?? 1;
-      await env.DB.prepare(
-        `UPDATE user_billing SET subscription_status = ?, subscribed_company_count = ? WHERE stripe_subscription_id = ?`
-      )
-        .bind(status, quantity, sub.id)
-        .run();
-      break;
-    }
+      case "customer.subscription.updated": {
+        const sub = event.data.object as Stripe.Subscription;
+        const status = sub.status === "active" || sub.status === "trialing"
+          ? "active"
+          : sub.status;
+        const quantity = sub.items.data[0]?.quantity ?? 1;
+        await env.DB.prepare(
+          `UPDATE user_billing SET subscription_status = ?, subscribed_company_count = ? WHERE stripe_subscription_id = ?`
+        )
+          .bind(status, quantity, sub.id)
+          .run();
+        break;
+      }
 
-    case "customer.subscription.deleted": {
-      const sub = event.data.object as Stripe.Subscription;
-      await env.DB.prepare(
-        `UPDATE user_billing SET subscription_status = 'cancelled', stripe_subscription_id = NULL WHERE stripe_subscription_id = ?`
-      )
-        .bind(sub.id)
-        .run();
-      break;
+      case "customer.subscription.deleted": {
+        const sub = event.data.object as Stripe.Subscription;
+        await env.DB.prepare(
+          `UPDATE user_billing SET subscription_status = 'cancelled', stripe_subscription_id = NULL WHERE stripe_subscription_id = ?`
+        )
+          .bind(sub.id)
+          .run();
+        break;
+      }
     }
+  } catch (err) {
+    // Release the claim so Stripe's retry can process this event again.
+    await env.DB.prepare(`DELETE FROM stripe_events WHERE event_id = ?`)
+      .bind(event.id)
+      .run();
+    throw err;
   }
 
   return Response.json({ received: true });
